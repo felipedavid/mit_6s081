@@ -1,0 +1,246 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..c113801 100644
+--- a/Makefile
++++ b/Makefile
+@@ -84,7 +84,7 @@ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
++CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+ 
+ ifdef LAB
+ LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a73b4f7..80aef2d 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -159,9 +159,11 @@ int             uartgetc(void);
+ 
+ // vm.c
+ void            kvminit(void);
++pagetable_t     ukvminit(struct proc *p);
+ void            kvminithart(void);
+ uint64          kvmpa(uint64);
+ void            kvmmap(uint64, uint64, uint64, int);
++void            ukvmmap(pagetable_t, uint64, uint64, uint64, int);
+ int             mappages(pagetable_t, uint64, uint64, uint64, int);
+ pagetable_t     uvmcreate(void);
+ void            uvminit(pagetable_t, uchar *, uint);
+@@ -178,6 +180,8 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t);
++int             uvm2k(pagetable_t, pagetable_t, uint64, uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+@@ -223,3 +227,7 @@ int             sockread(struct sock *, uint64, int);
+ int             sockwrite(struct sock *, uint64, int);
+ void            sockrecvudp(struct mbuf*, uint32, uint16, uint16);
+ #endif
++
++// vmcopyin.c
++int copyinstr_new(pagetable_t, char *, uint64, uint64);
++int copyin_new(pagetable_t, char *, uint64, uint64);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..9d7646e 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -116,6 +116,8 @@ exec(char *path, char **argv)
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+ 
++  if (p->pid == 1) vmprint(p->pagetable);
++
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..dbd0c7c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -21,6 +21,10 @@ static void freeproc(struct proc *p);
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++extern char etext[];
++
++extern pagetable_t kernel_pagetable;
++
+ // initialize the proc table at boot time.
+ void
+ procinit(void)
+@@ -40,6 +44,7 @@ procinit(void)
+       uint64 va = KSTACK((int) (p - proc));
+       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+       p->kstack = va;
++      p->pakstack = (uint64)pa;
+   }
+   kvminithart();
+ }
+@@ -121,6 +126,9 @@ found:
+     return 0;
+   }
+ 
++  p->kpagetable = ukvminit(p);
++  ukvmmap(p->kpagetable, p->kstack, (uint64)p->pakstack, PGSIZE, PTE_R | PTE_W);
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -130,6 +138,20 @@ found:
+   return p;
+ }
+ 
++void 
++kernel_freepagetable(pagetable_t pt) {
++    for (int i = 0; i < 512; i++) {
++        pte_t pte = pt[i];
++        if (pte & PTE_V) {
++            pt[i] = 0;
++            if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
++                kernel_freepagetable((pagetable_t)PTE2PA(pte));
++            }
++        }
++    }
++    kfree((void*)pt);
++}
++
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+ // p->lock must be held.
+@@ -141,6 +163,8 @@ freeproc(struct proc *p)
+   p->trapframe = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
++  if(p->kpagetable)
++    kernel_freepagetable(p->kpagetable);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -468,6 +492,12 @@ scheduler(void)
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
++        
++        // Make the MMU use the process's kernel page copy
++        // instead of the actual kernel pagetable
++        w_satp(MAKE_SATP(p->kpagetable));
++        sfence_vma();
++
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
+@@ -478,8 +508,11 @@ scheduler(void)
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
+-
+         found = 1;
++
++        // Make the MMU use the actual kernel pagetable
++        w_satp(MAKE_SATP(kernel_pagetable));
++        sfence_vma();
+       }
+       release(&p->lock);
+     }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..8a2e60f 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -96,8 +96,11 @@ struct proc {
+ 
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
++  uint64 pakstack;             // Physical address from kernel stack
++                               // (needed for create a map into kpagetable)
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
++  pagetable_t kpagetable;      // User page table
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..af23ffa 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -47,6 +47,36 @@ kvminit()
+   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+ }
+ 
++pagetable_t
++ukvminit(struct proc *p) {
++    pagetable_t upt = (pagetable_t) kalloc();
++    memset(upt, 0, PGSIZE);
++
++    // uart registers
++    ukvmmap(upt, UART0, UART0, PGSIZE, PTE_R | PTE_W);
++
++    // virtio mmio disk interface
++    ukvmmap(upt, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++
++    // CLINT
++    ukvmmap(upt, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++
++    // PLIC
++    ukvmmap(upt, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++
++    // map kernel text executable and read-only.
++    ukvmmap(upt, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
++
++    // map kernel data and the physical RAM we'll make use of.
++    ukvmmap(upt, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
++
++    // map the trampoline for trap entry/exit to
++    // the highest virtual address in the kernel.
++    ukvmmap(upt, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
++
++    return upt;
++}
++
+ // Switch h/w page table register to the kernel's page table,
+ // and enable paging.
+ void
+@@ -121,6 +151,13 @@ kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
+     panic("kvmmap");
+ }
+ 
++void
++ukvmmap(pagetable_t pt, uint64 va, uint64 pa, uint64 sz, int perm)
++{
++  if(mappages(pt, va, sz, pa, perm) != 0)
++    panic("ukvmmap");
++}
++
+ // translate a kernel virtual address to
+ // a physical address. only needed for
+ // addresses on the stack.
+@@ -440,3 +477,26 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++void vmprint(pagetable_t pt) {
++    printf("page table %p\n", pt);
++    for (int i = 0; i < 512; i++) {
++        if (!(pt[i] & PTE_V)) continue;
++        pagetable_t pt2 = (pagetable_t) PTE2PA(pt[i]);
++        printf("..%d: pte %p pa %p\n", 
++            i, pt[i], pt2);
++
++        for (int j = 0; j < 512; j++) {
++            if (!(pt2[j] & PTE_V)) continue;
++            pagetable_t pt3 = (pagetable_t) PTE2PA(pt2[j]);
++            printf(".. ..%d: pte %p pa %p\n", 
++                j, pt2[j], pt3);
++
++            for (int k = 0; k < 512; k++) {
++                if (!(pt3[k] & PTE_V)) continue;
++                printf(".. .. ..%d: pte %p pa %p\n", 
++                    k, pt3[k], PTE2PA(pt3[k]));
++            }
++        }
++    }
++}
